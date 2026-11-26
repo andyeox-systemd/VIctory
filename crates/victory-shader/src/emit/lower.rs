@@ -11232,6 +11232,70 @@ mod tests {
         }
     }
 
+    /// Use the selected image descriptor for a float load, then feed its
+    /// result to an unsigned atomic on the same image. Both handles are live.
+    fn check_mixed_image_handles(select_descriptor: &[u32]) {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0 (UAV table)
+            0xBE85_0380, // s_mov_b32 s5, 0
+        ];
+        words.extend_from_slice(select_descriptor);
+        words.extend_from_slice(&[
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xF000_0F08,
+            0x0002_0200, // image_load v[2:5], v[0:1], s[8:15], dmask:0xf
+            0xF054_0108,
+            0x0002_0200, // image_atomic_umin v2, v[0:1], s[8:15], dmask:1
+            S_ENDPGM,
+        ]);
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        let annotations = lower_with(&words, layout, used).unwrap().annotations;
+        // Texture2D UAV (0x1002), annotated for four floats and for one U32.
+        for props in [(0x1002, 0x409), (0x1002, 0x105)] {
+            assert!(
+                annotations.contains(&props),
+                "missing {props:x?} in {annotations:x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_image_handles_at_a_uniform_dynamic_offset() {
+        // Scale the uniform descriptor index to a byte offset at run time,
+        // so the fixed-address cache at shader entry cannot serve this load.
+        check_mixed_image_handles(&[
+            0x8F02_8501, // s_lshl_b32 s2, s1, 5
+            0xF40C_0202,
+            0x0400_0000, // s_load_dwordx8 s[8:15], s[4:5], s2
+        ]);
+    }
+
+    #[test]
+    fn mixed_image_handles_after_a_control_flow_join() {
+        // Each branch loads a different descriptor into s[8:15]. The
+        // accesses after the join share the selected index and differ in type.
+        check_mixed_image_handles(&[
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF84_0003, // s_cbranch_scc0 -> second descriptor
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0xBF82_0002, // s_branch -> join
+            0xF40C_0202,
+            0xFA00_0020, // s_load_dwordx8 s[8:15], s[4:5], 32
+        ]);
+    }
+
     #[test]
     fn descriptors_reloaded_from_a_root_table_share_one_handle() {
         // The view table at s0 (2D textures at entries 0 and 1, a raw UAV at
